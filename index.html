@@ -1,0 +1,429 @@
+import os, textwrap, zipfile
+
+base = "/mnt/data/gram_bazaar_goa_fullstack"
+os.makedirs(base + "/public", exist_ok=True)
+
+files = {
+"package.json": r'''{
+  "name": "gram-bazaar-goa",
+  "version": "1.0.0",
+  "description": "Goa local products marketplace starter with Express and SQLite",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "express": "^4.21.2"
+  }
+}''',
+"server.js": r'''const express = require("express");
+const path = require("path");
+const Database = require("better-sqlite3");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const db = new Database(path.join(__dirname, "gram_bazaar.sqlite"));
+db.pragma("journal_mode = WAL");
+db.exec(`
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  price REAL NOT NULL CHECK(price >= 0),
+  discount_percent INTEGER NOT NULL DEFAULT 0 CHECK(discount_percent BETWEEN 0 AND 80),
+  emoji TEXT NOT NULL DEFAULT '🛍️',
+  sizes TEXT NOT NULL DEFAULT '',
+  stock INTEGER NOT NULL DEFAULT 20 CHECK(stock >= 0),
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_code TEXT NOT NULL UNIQUE,
+  customer_name TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  address TEXT NOT NULL,
+  pincode TEXT NOT NULL,
+  items_json TEXT NOT NULL,
+  subtotal REAL NOT NULL,
+  discount_total REAL NOT NULL,
+  delivery_fee REAL NOT NULL,
+  total REAL NOT NULL,
+  payment_method TEXT NOT NULL DEFAULT 'COD',
+  status TEXT NOT NULL DEFAULT 'Order received',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS returns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_code TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'Return requested',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  customer_name TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+  comment TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS likes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  visitor_key TEXT NOT NULL,
+  UNIQUE(product_id, visitor_key)
+);
+`);
+
+const count = db.prepare("SELECT COUNT(*) AS n FROM products").get().n;
+if (!count) {
+  const seed = [
+    ["Goan Cashew Nuts (250g)","Food","Locally inspired cashew snack. Check packaging and seller details before buying.",320,10,"🥜","",30],
+    ["Kokum Syrup (750ml)","Food","Traditional kokum drink concentrate.",180,0,"🧃","",25],
+    ["Bebinca Cake","Food","Goan layered dessert. Confirm freshness and delivery date with seller.",450,5,"🍰","",12],
+    ["Kunbi-style Handloom Saree","Clothing","Handloom-inspired local textile listing; verify origin with seller.",1850,12,"🥻","Free Size",8],
+    ["Coconut Shell Craft","Handicrafts","Handmade decorative craft.",280,0,"🥥","",15],
+    ["Azulejos-style Tile Art","Art & Decor","Decorative tile artwork inspired by Goan-Portuguese visual traditions.",550,8,"🎨","",10],
+    ["Bamboo & Cane Basket","Handicrafts","Handwoven basket for home use.",350,0,"🧺","Small,Medium,Large",18],
+    ["Goan Spice Mix","Food","Aromatic spice blend. Review ingredients and allergen information before use.",120,0,"🌶️","",40],
+    ["Beachwear Shirt","Clothing","Casual shirt; check size chart before ordering.",650,15,"👕","S,M,L,XL,XXL",20],
+    ["Local Artist Postcard Set","Art & Decor","Illustrated Goa-inspired postcard set.",160,0,"🖼️","",25],
+    ["Cashew Feni-inspired Gift Box","Gifts","Gift box listing. Alcoholic products are not sold by this demo site.",390,5,"🎁","",10]
+  ];
+  const ins = db.prepare(`INSERT INTO products(name,category,description,price,discount_percent,emoji,sizes,stock)
+    VALUES(?,?,?,?,?,?,?,?)`);
+  const tx = db.transaction(rows => rows.forEach(r => ins.run(...r)));
+  tx(seed);
+}
+
+app.use(express.json({ limit: "100kb" }));
+app.use(express.static(path.join(__dirname, "public")));
+
+const selectProducts = db.prepare("SELECT * FROM products WHERE active=1 ORDER BY id DESC");
+app.get("/api/products", (req, res) => {
+  const products = selectProducts.all().map(p => ({
+    ...p, final_price: Math.round(p.price * (100-p.discount_percent))/100,
+    sizes: p.sizes ? p.sizes.split(",") : []
+  }));
+  res.json(products);
+});
+
+app.post("/api/orders", (req, res) => {
+  const { customer_name, phone, address, pincode, items, payment_method } = req.body || {};
+  if (!customer_name?.trim() || !phone?.trim() || !address?.trim() || !pincode?.trim()) {
+    return res.status(400).json({ error: "Please fill name, phone, full address and PIN code." });
+  }
+  if (!/^[0-9+\-\s]{8,15}$/.test(phone.trim())) return res.status(400).json({ error: "Enter a valid phone number." });
+  if (!/^[0-9]{6}$/.test(pincode.trim())) return res.status(400).json({ error: "PIN code must be 6 digits." });
+  if (!Array.isArray(items) || !items.length || items.length > 40) return res.status(400).json({ error: "Your cart is empty or too large." });
+  if (payment_method && payment_method !== "COD") return res.status(400).json({ error: "Only Cash on Delivery is enabled in this starter." });
+
+  let subtotal = 0, discountTotal = 0;
+  const safeItems = [];
+  const get = db.prepare("SELECT * FROM products WHERE id=? AND active=1");
+  const reduceStock = db.prepare("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?");
+  try {
+    const transaction = db.transaction(() => {
+      for (const item of items) {
+        const id = Number(item.product_id), qty = Number(item.quantity);
+        if (!Number.isInteger(id) || !Number.isInteger(qty) || qty < 1 || qty > 30) throw new Error("Invalid product or quantity.");
+        const p = get.get(id);
+        if (!p) throw new Error("A product is no longer available.");
+        if (p.stock < qty) throw new Error(`${p.name} does not have enough stock.`);
+        const discounted = Math.round(p.price * (100-p.discount_percent))/100;
+        const originalTotal = p.price * qty, finalTotal = discounted * qty;
+        subtotal += originalTotal; discountTotal += originalTotal-finalTotal;
+        const stockResult = reduceStock.run(qty, id, qty);
+        if (!stockResult.changes) throw new Error(`${p.name} is out of stock.`);
+        safeItems.push({product_id:id, name:p.name, quantity:qty, price:p.price, final_price:discounted, selected_size:String(item.selected_size || "").slice(0,20)});
+      }
+      const delivery = (subtotal-discountTotal) >= 999 ? 0 : 49;
+      const total = Math.round((subtotal-discountTotal+delivery)*100)/100;
+      const code = "GBG-" + Date.now().toString().slice(-8) + "-" + Math.floor(Math.random()*900+100);
+      db.prepare(`INSERT INTO orders(order_code,customer_name,phone,address,pincode,items_json,subtotal,discount_total,delivery_fee,total,payment_method)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(code, customer_name.trim().slice(0,100), phone.trim(), address.trim().slice(0,500), pincode.trim(), JSON.stringify(safeItems), subtotal, discountTotal, delivery, total, "COD");
+      return {code, subtotal, discount_total:discountTotal, delivery_fee:delivery, total};
+    });
+    const order = transaction();
+    res.status(201).json({message:"Order received successfully.", order});
+  } catch (e) {
+    res.status(400).json({error:e.message || "Could not place order."});
+  }
+});
+
+// Customer can check a single order using order code and phone number.
+app.post("/api/order-lookup", (req, res) => {
+  const { order_code, phone } = req.body || {};
+  if (!order_code || !phone) return res.status(400).json({error:"Enter order code and phone."});
+  const o = db.prepare("SELECT * FROM orders WHERE order_code=? AND phone=?").get(String(order_code), String(phone));
+  if (!o) return res.status(404).json({error:"Order not found. Check your details."});
+  res.json({...o, items:JSON.parse(o.items_json)});
+});
+
+// Return requests: accepted as requests, not automatic refunds.
+app.post("/api/returns", (req, res) => {
+  const { order_code, phone, reason, details } = req.body || {};
+  if (!order_code || !phone || !reason) return res.status(400).json({error:"Enter order code, phone and return reason."});
+  const order = db.prepare("SELECT id FROM orders WHERE order_code=? AND phone=?").get(String(order_code), String(phone));
+  if (!order) return res.status(404).json({error:"Order not found for those details."});
+  const result = db.prepare("INSERT INTO returns(order_code,reason,details) VALUES(?,?,?)")
+    .run(String(order_code).slice(0,40), String(reason).slice(0,100), String(details || "").slice(0,500));
+  res.status(201).json({message:"Return request submitted. Seller must review it.", return_id:result.lastInsertRowid});
+});
+
+app.post("/api/reviews", (req, res) => {
+  const { product_id, customer_name, rating, comment } = req.body || {};
+  if (!Number.isInteger(Number(product_id)) || !customer_name?.trim() || !Number.isInteger(Number(rating)) || rating<1 || rating>5 || !comment?.trim()) {
+    return res.status(400).json({error:"Please enter your name, rating (1–5) and feedback."});
+  }
+  if (!db.prepare("SELECT id FROM products WHERE id=?").get(Number(product_id))) return res.status(404).json({error:"Product not found."});
+  db.prepare("INSERT INTO reviews(product_id,customer_name,rating,comment) VALUES(?,?,?,?)")
+    .run(Number(product_id), customer_name.trim().slice(0,80), Number(rating), comment.trim().slice(0,1000));
+  res.status(201).json({message:"Thank you for your feedback."});
+});
+
+app.get("/api/reviews/:productId", (req,res) => {
+  const reviews = db.prepare("SELECT customer_name,rating,comment,created_at FROM reviews WHERE product_id=? ORDER BY id DESC LIMIT 30")
+    .all(Number(req.params.productId));
+  res.json(reviews);
+});
+
+app.post("/api/likes", (req,res) => {
+  const { product_id, visitor_key } = req.body || {};
+  if (!Number.isInteger(Number(product_id)) || typeof visitor_key !== "string" || visitor_key.length<8 || visitor_key.length>100) {
+    return res.status(400).json({error:"Invalid like request."});
+  }
+  if (!db.prepare("SELECT id FROM products WHERE id=?").get(Number(product_id))) return res.status(404).json({error:"Product not found."});
+  const exists = db.prepare("SELECT id FROM likes WHERE product_id=? AND visitor_key=?").get(Number(product_id), visitor_key);
+  if (exists) db.prepare("DELETE FROM likes WHERE id=?").run(exists.id);
+  else db.prepare("INSERT OR IGNORE INTO likes(product_id,visitor_key) VALUES(?,?)").run(Number(product_id),visitor_key);
+  const likes = db.prepare("SELECT COUNT(*) AS n FROM likes WHERE product_id=?").get(Number(product_id)).n;
+  res.json({liked:!exists, likes});
+});
+
+// Basic seller dashboard endpoint protected by a password supplied via environment.
+// Set ADMIN_PASSWORD before using on a public deployment. This is a starter guard,
+// not a substitute for proper user accounts, rate limiting and hardened admin auth.
+function requireAdmin(req,res,next) {
+  const expected = process.env.ADMIN_PASSWORD;
+  if (!expected) return res.status(503).json({error:"Seller/admin API is disabled. Set ADMIN_PASSWORD on the server first."});
+  if (req.get("x-admin-password") !== expected) return res.status(401).json({error:"Seller password incorrect."});
+  next();
+}
+app.get("/api/admin/orders", requireAdmin, (req,res) => {
+  const rows = db.prepare("SELECT order_code,customer_name,phone,address,pincode,items_json,total,status,created_at FROM orders ORDER BY id DESC LIMIT 200").all();
+  res.json(rows.map(o=>({...o,items:JSON.parse(o.items_json)})));
+});
+app.patch("/api/admin/orders/:code", requireAdmin, (req,res) => {
+  const allowed = ["Order received","Confirmed","Packed","Out for delivery","Delivered","Cancelled"];
+  if (!allowed.includes(req.body.status)) return res.status(400).json({error:"Invalid order status."});
+  const result = db.prepare("UPDATE orders SET status=? WHERE order_code=?").run(req.body.status, req.params.code);
+  if (!result.changes) return res.status(404).json({error:"Order not found."});
+  res.json({message:"Order status updated."});
+});
+app.post("/api/admin/products", requireAdmin, (req,res) => {
+  const {name,category,description,price,discount_percent,emoji,sizes,stock} = req.body || {};
+  if (!name?.trim() || !category?.trim() || !Number.isFinite(Number(price)) || Number(price)<=0) return res.status(400).json({error:"Valid name, category and price are required."});
+  const result = db.prepare(`INSERT INTO products(name,category,description,price,discount_percent,emoji,sizes,stock)
+    VALUES(?,?,?,?,?,?,?,?)`).run(name.trim().slice(0,120),category.trim().slice(0,60),String(description||"").slice(0,1000),Number(price),Math.min(80,Math.max(0,Number(discount_percent)||0)),String(emoji||"🛍️").slice(0,10),String(sizes||"").slice(0,100),Math.max(0,Math.floor(Number(stock)||0)));
+  res.status(201).json({id:result.lastInsertRowid});
+});
+
+app.get("/api/health", (req,res)=>res.json({ok:true}));
+app.listen(PORT, () => console.log(`Gram Bazaar running at http://localhost:${PORT}`));
+''',
+"public/index.html": r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gram Bazaar Goa | Local Marketplace</title>
+<style>
+:root{--green:#176b45;--deep:#12442f;--cream:#fff7e9;--orange:#f0a33a;--ink:#24352b;--muted:#68776d;--line:#e1e8e1}
+*{box-sizing:border-box}body{margin:0;background:#f7f9f6;color:var(--ink);font-family:Arial,sans-serif}header{background:var(--deep);color:#fff;padding:16px 5%;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}header h1{margin:0;font-size:25px}nav{display:flex;gap:8px;flex-wrap:wrap}nav a{color:#fff;text-decoration:none;padding:9px;border-radius:7px}nav a:hover{background:#ffffff20}.hero{padding:54px 6%;background:linear-gradient(120deg,#e0f3e4,#fff0d6)}.hero h2{font-size:clamp(30px,5vw,48px);margin:0 0 12px}.hero p{max-width:650px;line-height:1.7}.wrap{padding:30px 6%}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 4px 15px #203c2910}.emoji{font-size:48px;text-align:center;background:var(--cream);border-radius:10px;padding:12px}.price{font-weight:bold;color:var(--green);font-size:21px}.old{color:#879087;text-decoration:line-through;font-size:14px}.tag{display:inline-block;background:#e4f4e8;color:#176b45;border-radius:20px;padding:5px 9px;font-size:12px}.controls{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}input,select,textarea{width:100%;padding:11px;border:1px solid #cbd8cc;border-radius:8px;font:inherit;background:#fff}button{border:0;padding:11px 14px;border-radius:8px;background:var(--green);color:white;cursor:pointer;font-weight:600}button:hover{filter:brightness(.94)}button.alt{background:#f1eadf;color:#29372e}button.like{background:#fff0f0;color:#b52838}label{font-size:14px;font-weight:600;display:grid;gap:6px}.form{display:grid;gap:12px;max-width:650px}.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.muted{color:var(--muted);font-size:13px;line-height:1.5}.notice{padding:13px;background:#fff1d5;border-radius:9px;line-height:1.6}.status{margin-top:12px;font-weight:600}.cart-row{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);padding:12px 0}.footer{background:var(--deep);color:#fff;text-align:center;padding:25px}.hidden{display:none!important}details{margin-top:12px}summary{cursor:pointer;font-weight:bold}#message{white-space:pre-wrap}.product-card h3{margin-bottom:8px}.smallbtn{padding:7px 9px} @media(max-width:600px){.wrap{padding:24px 16px}.hero{padding:36px 16px}header{padding:16px}}
+</style>
+</head>
+<body>
+<header><h1>🌴 Gram Bazaar Goa</h1><nav><a href="#home">Home</a><a href="#products">Shop</a><a href="#cart">Cart 🛒 <span id="cartCount">0</span></a><a href="#orders">My Order</a><a href="#returns">Returns</a><a href="#feedback">Feedback</a></nav></header>
+<main>
+<section class="hero" id="home"><span class="tag">GOA • LOCAL • HANDMADE</span><h2>Discover Goa. Shop Local.</h2><p>Explore Goan food specialties, local art, crafts, textiles and gifts. Support village makers with convenient home delivery.</p><button onclick="document.querySelector('#products').scrollIntoView({behavior:'smooth'})">Shop Goa Products</button> <button class="alt" onclick="document.querySelector('#returns').scrollIntoView({behavior:'smooth'})">Return policy</button><p class="muted">Delivery: Goa PIN codes are accepted at checkout. Delivery coverage and timing must be confirmed by the seller.</p></section>
+<section class="wrap"><h2>✨ Offers & Benefits</h2><div class="grid"><div class="card"><h3>🏷️ Sale prices</h3><p>Discounts appear on selected products.</p></div><div class="card"><h3>🚚 Home delivery</h3><p>₹49 delivery fee; free delivery on eligible carts of ₹999 or more in this demo.</p></div><div class="card"><h3>💵 Cash on Delivery</h3><p>COD order requests are recorded by the website backend.</p></div><div class="card"><h3>❤️ Like & save</h3><p>Tap the heart to like a product from this browser.</p></div></div></section>
+<section class="wrap" id="products"><h2>🛍️ Shop Goa Products</h2><p class="muted">Sample catalogue is included. Verify product origin, food ingredients, stock and seller details before selling publicly.</p><div class="controls"><input id="search" placeholder="Search products..." oninput="renderProducts()"><select id="category" onchange="renderProducts()"><option>All</option><option>Food</option><option>Handicrafts</option><option>Clothing</option><option>Art & Decor</option><option>Gifts</option></select><select id="sort" onchange="renderProducts()"><option value="default">Recommended</option><option value="low">Price: low to high</option><option value="high">Price: high to low</option></select></div><div class="grid" id="productGrid"><p>Loading products…</p></div></section>
+<section class="wrap" id="cart"><h2>🛒 Your Cart</h2><div class="card"><div id="cartItems">Your cart is empty.</div><hr><p>Subtotal: ₹<span id="subtotal">0.00</span></p><p>Discount: −₹<span id="discount">0.00</span></p><p>Delivery: ₹<span id="delivery">0.00</span></p><h2>Total: ₹<span id="total">0.00</span></h2><button class="alt" onclick="clearCart()">Clear cart</button></div></section>
+<section class="wrap" id="checkout"><h2>🏠 Secure Checkout Request</h2><div class="card"><p class="notice">This starter supports Cash on Delivery order requests only. No online payment is taken. Only submit details to your own trusted website after you deploy it with HTTPS and a privacy notice.</p><form class="form" id="checkoutForm"><div class="two"><label>Full name<input id="customerName" maxlength="100" required autocomplete="name"></label><label>Phone number<input id="phone" type="tel" required autocomplete="tel" placeholder="10 digit mobile number"></label></div><label>Full delivery address<textarea id="address" maxlength="500" required autocomplete="street-address"></textarea></label><label>Goa PIN code<input id="pincode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required placeholder="6 digit PIN code"></label><label>Payment method<select id="payment"><option value="COD">Cash on Delivery (COD)</option></select></label><label><input type="checkbox" id="agree" required style="width:auto"> I agree to the Privacy Notice and Return Policy.</label><button type="submit">Place Order (COD)</button></form><div id="message" class="status" role="status"></div></div></section>
+<section class="wrap" id="orders"><h2>📦 Track Your Order</h2><div class="card"><p class="muted">Use your order code and phone number. Do not share these details publicly.</p><form class="form" id="lookupForm"><label>Order code<input id="lookupCode" required placeholder="e.g. GBG-12345678-123"></label><label>Phone number<input id="lookupPhone" required type="tel"></label><button type="submit">Find my order</button></form><div id="lookupResult" class="status"></div></div></section>
+<section class="wrap" id="returns"><h2>↩️ Return / Exchange Request</h2><div class="card"><p>Return eligibility depends on product type, condition, seller policy and applicable consumer law. Perishable food and custom-made goods may have different rules. This form requests a return; it does not automatically approve a refund.</p><form class="form" id="returnForm"><label>Order code<input id="returnCode" required></label><label>Phone number used for order<input id="returnPhone" type="tel" required></label><label>Reason<select id="returnReason"><option>Damaged item</option><option>Wrong item received</option><option>Item not as described</option><option>Size issue</option><option>Other</option></select></label><label>Details<textarea id="returnDetails" maxlength="500" placeholder="Explain the issue"></textarea></label><button type="submit">Submit return request</button></form><div id="returnMessage" class="status"></div></div></section>
+<section class="wrap" id="feedback"><h2>⭐ Customer Feedback</h2><div class="card"><form class="form" id="reviewForm"><label>Product<select id="reviewProduct" required></select></label><label>Your name<input id="reviewName" maxlength="80" required></label><label>Rating<select id="rating"><option value="5">5 - Excellent</option><option value="4">4 - Very good</option><option value="3">3 - Good</option><option value="2">2 - Fair</option><option value="1">1 - Poor</option></select></label><label>Your review<textarea id="reviewComment" maxlength="1000" required></textarea></label><button type="submit">Send feedback</button></form><div id="reviewMessage" class="status"></div><div id="reviewsList"></div></div></section>
+<section class="wrap" id="privacy"><h2>🔐 Privacy, Safety & Size Guide</h2><div class="card"><h3>Privacy notice (starter template)</h3><p>We use your name, phone, delivery address and order details to process orders and customer support. Do not collect unnecessary personal data. Publish a complete privacy notice that identifies the real seller/business, data retention, customer rights and contact details before going live. Use HTTPS, restrict database access, protect admin accounts and back up data securely.</p><h3>Shopping safety</h3><p>Check seller identity, product descriptions, ingredients, origin, final price, delivery charges and return conditions before ordering. Do not store card details or OTPs in this site. Use a trusted payment gateway if online payments are later added.</p><h3>Size guide</h3><p>Clothing products may show sizes. Always verify the product's actual measurements with the seller before ordering. This demo allows selecting a size for listed clothing products.</p><table style="border-collapse:collapse;width:100%"><tr><th style="text-align:left;padding:8px;border-bottom:1px solid #ddd">Label</th><th style="text-align:left;padding:8px;border-bottom:1px solid #ddd">Chest guide (approx.)</th></tr><tr><td style="padding:8px">S</td><td style="padding:8px">36 in</td></tr><tr><td style="padding:8px">M</td><td style="padding:8px">38 in</td></tr><tr><td style="padding:8px">L</td><td style="padding:8px">40 in</td></tr><tr><td style="padding:8px">XL</td><td style="padding:8px">42 in</td></tr><tr><td style="padding:8px">XXL</td><td style="padding:8px">44 in</td></tr></table><p class="muted">Measurements are illustrative only; each garment's size chart should be confirmed by its seller.</p></div></section>
+<section class="wrap" id="seller"><h2>🧑‍💼 Seller/Admin</h2><div class="card"><p>This starter includes protected admin APIs for order management and adding products. A full seller dashboard/login UI is not yet included.</p><p class="muted">Set ADMIN_PASSWORD on the server, then use an authenticated admin interface. Never put an admin password in this HTML file.</p><details><summary>How to enable admin API</summary><p>Windows PowerShell: <code>$env:ADMIN_PASSWORD="use-a-long-unique-password"; npm start</code></p><p>Linux/macOS: <code>ADMIN_PASSWORD="use-a-long-unique-password" npm start</code></p><p>Admin endpoints: <code>GET /api/admin/orders</code>, <code>PATCH /api/admin/orders/:code</code>, <code>POST /api/admin/products</code>. Send the password in the <code>x-admin-password</code> header. Use only over HTTPS in a private, deployed environment.</p></details></div></section>
+</main><footer class="footer">🌴 Gram Bazaar Goa · Local products · Responsible shopping<br><span class="muted" style="color:#e5eee6">Starter project — configure real seller details and policies before launch.</span></footer>
+<script src="/app.js"></script>
+</body></html>''',
+"public/app.js": r'''const API = "/api";
+let products = [], cart = JSON.parse(localStorage.getItem("gbg_cart") || "[]");
+const visitorKey = (() => {
+  let k = localStorage.getItem("gbg_visitor");
+  if (!k) { k = "visitor-" + crypto.randomUUID(); localStorage.setItem("gbg_visitor", k); }
+  return k;
+})();
+const money = n => Number(n || 0).toFixed(2);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function request(url, options={}) {
+  const res = await fetch(API + url, {headers:{"Content-Type":"application/json",...(options.headers||{})}, ...options});
+  const data = await res.json().catch(()=>({error:"Server returned an unreadable response."}));
+  if (!res.ok) throw new Error(data.error || "Request failed.");
+  return data;
+}
+async function init() {
+  try {
+    products = await request("/products");
+    renderProducts(); renderCart(); populateReviewProducts();
+  } catch(e) {
+    document.getElementById("productGrid").innerHTML = `<p>${esc(e.message)}. Make sure the Node.js server is running.</p>`;
+  }
+}
+function renderProducts() {
+  const q = document.getElementById("search").value.toLowerCase();
+  const cat = document.getElementById("category").value;
+  const sort = document.getElementById("sort").value;
+  let list = products.filter(p => (p.name+" "+p.description).toLowerCase().includes(q) && (cat==="All" || p.category===cat));
+  if (sort==="low") list.sort((a,b)=>a.final_price-b.final_price);
+  if (sort==="high") list.sort((a,b)=>b.final_price-a.final_price);
+  const grid = document.getElementById("productGrid");
+  if (!list.length) { grid.innerHTML="<p>No products found.</p>"; return; }
+  grid.innerHTML = list.map(p => `<article class="card product-card">
+    <div class="emoji">${esc(p.emoji)}</div><p><span class="tag">${esc(p.category)}</span> ${p.discount_percent?`<span class="tag">${p.discount_percent}% OFF</span>`:""}</p>
+    <h3>${esc(p.name)}</h3><p class="muted">${esc(p.description)}</p>
+    ${p.discount_percent?`<span class="old">₹${money(p.price)}</span> `:""}<span class="price">₹${money(p.final_price)}</span>
+    <p class="muted">Stock: ${p.stock} | ❤️ ${p.like_count || 0}</p>
+    ${p.sizes.length?`<label>Size<select id="size-${p.id}"><option value="">Choose size</option>${p.sizes.map(s=>`<option>${esc(s)}</option>`).join("")}</select></label>`:""}
+    <p><button onclick="addCart(${p.id})" ${p.stock<=0?"disabled":""}>Add to cart</button> <button class="like" onclick="likeProduct(${p.id})">♥ Like</button></p>
+    <details><summary>Reviews</summary><div id="reviews-${p.id}">Open to load reviews.</div><button class="alt smallbtn" onclick="loadReviews(${p.id})">Load reviews</button></details>
+  </article>`).join("");
+}
+function saveCart(){localStorage.setItem("gbg_cart",JSON.stringify(cart));}
+function addCart(id) {
+  const p=products.find(x=>x.id===id); if(!p || p.stock<1)return alert("Product unavailable.");
+  const sizeEl=document.getElementById("size-"+id), size=sizeEl?sizeEl.value:"";
+  if(sizeEl && !size)return alert("Please choose a size first.");
+  const key=id+"|"+size, existing=cart.find(x=>x.key===key);
+  if(existing) existing.quantity=Math.min(30,existing.quantity+1);
+  else cart.push({key,product_id:id,quantity:1,selected_size:size});
+  saveCart();renderCart();
+}
+function renderCart() {
+  const box=document.getElementById("cartItems"); let subtotal=0, discounted=0, count=0;
+  if(!cart.length) box.innerHTML="<p>Your cart is empty.</p>";
+  else box.innerHTML=cart.map((item,i)=>{
+    const p=products.find(x=>x.id===item.product_id);if(!p)return "";
+    subtotal+=p.price*item.quantity;discounted+=p.final_price*item.quantity;count+=item.quantity;
+    return `<div class="cart-row"><div><b>${esc(p.name)}</b> ${item.selected_size?`(Size: ${esc(item.selected_size)})`:""}<br><span class="muted">₹${money(p.final_price)} × ${item.quantity}</span></div><div><button class="smallbtn" onclick="qty(${i},-1)">−</button> <button class="smallbtn" onclick="qty(${i},1)">+</button> <button class="alt smallbtn" onclick="removeCart(${i})">Remove</button></div></div>`;
+  }).join("");
+  const discount=subtotal-discounted,delivery=count?(discounted>=999?0:49):0;
+  document.getElementById("cartCount").textContent=count;
+  document.getElementById("subtotal").textContent=money(subtotal);
+  document.getElementById("discount").textContent=money(discount);
+  document.getElementById("delivery").textContent=money(delivery);
+  document.getElementById("total").textContent=money(discounted+delivery);
+}
+function qty(i,d){if(!cart[i])return;cart[i].quantity+=d;if(cart[i].quantity<=0)cart.splice(i,1);saveCart();renderCart();}
+function removeCart(i){cart.splice(i,1);saveCart();renderCart();}
+function clearCart(){cart=[];saveCart();renderCart();}
+document.getElementById("checkoutForm").addEventListener("submit",async e=>{
+  e.preventDefault();const message=document.getElementById("message");message.textContent="Placing order…";
+  if(!cart.length){message.textContent="Your cart is empty.";return;}
+  try{
+    const data=await request("/orders",{method:"POST",body:JSON.stringify({
+      customer_name:document.getElementById("customerName").value,
+      phone:document.getElementById("phone").value,
+      address:document.getElementById("address").value,
+      pincode:document.getElementById("pincode").value,
+      payment_method:"COD",
+      items:cart.map(x=>({product_id:x.product_id,quantity:x.quantity,selected_size:x.selected_size}))
+    })});
+    cart=[];saveCart();renderCart();e.target.reset();
+    message.textContent=`✅ ${data.message}\nYour order code: ${data.order.code}\nTotal: ₹${money(data.order.total)}\nSave this code to track your order.`;
+    document.getElementById("lookupCode").value=data.order.code;
+    document.getElementById("lookupPhone").value=document.getElementById("phone").value;
+  }catch(err){message.textContent="Order could not be placed: "+err.message;}
+});
+document.getElementById("lookupForm").addEventListener("submit",async e=>{
+  e.preventDefault();const out=document.getElementById("lookupResult");out.textContent="Searching…";
+  try{const o=await request("/order-lookup",{method:"POST",body:JSON.stringify({order_code:document.getElementById("lookupCode").value.trim(),phone:document.getElementById("lookupPhone").value.trim()})});
+    out.innerHTML=`<div class="card"><h3>Order ${esc(o.order_code)}</h3><p>Status: <b>${esc(o.status)}</b></p><p>Total: ₹${money(o.total)}</p><p>Placed: ${esc(o.created_at)}</p><p>Items: ${o.items.map(i=>`${esc(i.name)} × ${i.quantity}${i.selected_size?" (Size "+esc(i.selected_size)+")":""}`).join(", ")}</p></div>`;
+  }catch(err){out.textContent=err.message;}
+});
+document.getElementById("returnForm").addEventListener("submit",async e=>{
+  e.preventDefault();const out=document.getElementById("returnMessage");out.textContent="Submitting…";
+  try{const d=await request("/returns",{method:"POST",body:JSON.stringify({order_code:document.getElementById("returnCode").value.trim(),phone:document.getElementById("returnPhone").value.trim(),reason:document.getElementById("returnReason").value,details:document.getElementById("returnDetails").value})});out.textContent=`✅ ${d.message} Request ID: ${d.return_id}`;e.target.reset();}
+  catch(err){out.textContent=err.message;}
+});
+function populateReviewProducts(){document.getElementById("reviewProduct").innerHTML=products.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join("");}
+document.getElementById("reviewForm").addEventListener("submit",async e=>{
+  e.preventDefault();const out=document.getElementById("reviewMessage");out.textContent="Sending…";
+  try{const d=await request("/reviews",{method:"POST",body:JSON.stringify({product_id:Number(document.getElementById("reviewProduct").value),customer_name:document.getElementById("reviewName").value,rating:Number(document.getElementById("rating").value),comment:document.getElementById("reviewComment").value})});out.textContent=d.message;e.target.reset();}
+  catch(err){out.textContent=err.message;}
+});
+async function loadReviews(id){
+  const box=document.getElementById("reviews-"+id);box.textContent="Loading…";
+  try{const rows=await request("/reviews/"+id);box.innerHTML=rows.length?rows.map(r=>`<p><b>${esc(r.customer_name)}</b> — ${"★".repeat(r.rating)}<br>${esc(r.comment)}</p>`).join(""):"No reviews yet.";}
+  catch(e){box.textContent=e.message;}
+}
+async function likeProduct(id){
+  try{const d=await request("/likes",{method:"POST",body:JSON.stringify({product_id:id,visitor_key:visitorKey})});const p=products.find(x=>x.id===id);if(p)p.like_count=d.likes;renderProducts();}
+  catch(e){alert(e.message);}
+}
+init();
+'''
+}
+for rel, content in files.items():
+    path = os.path.join(base, rel)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+readme = r'''# Gram Bazaar Goa — Full-stack starter
+
+## Features
+- Goa-inspired product catalogue, categories, search and price sorting
+- SQLite database and Express backend
+- Server-side order creation and stock decrement
+- COD checkout, order code + order lookup using code and phone
+- Discounts and delivery fee calculation (example rules)
+- Return request submission (seller review required)
+- Product likes and customer reviews
+- Clothing size selection
+- Basic privacy/safety guidance
+- Protected admin API for orders/status and adding products
+
+## Run locally
+1. Install Node.js LTS from https://nodejs.org/
+2. Extract this folder.
+3. Open terminal inside this folder.
+4. Run `npm install`
+5. Start:
+   - Windows PowerShell: `$env:ADMIN_PASSWORD="make-a-long-unique-password"; npm start`
+   - macOS/Linux: `ADMIN_PASSWORD="make-a-long-unique-password" npm start`
+6. Open http://localhost:3000
+
+The server creates `gram_bazaar.sqlite` automatically.
+
+## Important limitations before real public selling
+- This is a starter, not a production-certified commerce system.
+- COD orders are saved in the server database; seller/admin must monitor them.
+- No real payment gateway, SMS/WhatsApp/email notifications, delivery partner integration, customer login, full seller/admin dashboard, image upload or automated refund processing is included.
+- Admin API uses a simple environment password header for local demonstration. For public production use proper user accounts, hashed passwords, role-based authorization, CSRF/rate-limit protections, HTTPS and security review.
+- Database is a local SQLite file. For multi-instance cloud hosting use a managed database and backups.
+- Set real delivery areas, return/refund policies, contact information, tax/invoice rules and privacy notice before launch. Confirm that products are authentic and lawful to sell. Do not use the example gift box to sell alcohol; this demo does not enable alcohol sales.
+- Do not collect card numbers, UPI PINs, OTPs or other payment secrets on this site.
+'''
+with open(base + "/README.md", "w", encoding="utf-8") as f:
+    f.write(readme)
+
+zip_path = "/mnt/data/gram_bazaar_goa_fullstack.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, names in os.walk(base):
+        for name in names:
+            full = os.path.join(root, name)
+            z.write(full, os.path.relpath(full, base))
+print(zip_path, os.path.getsize(zip_path))
